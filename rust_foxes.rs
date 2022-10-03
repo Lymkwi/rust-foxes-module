@@ -64,6 +64,11 @@ impl Operations for FoxDev {
             writer.write_slice(very)?;
         }
         written += many_foxes * 4;
-        Ok(written) // If we always return n, n>0, the reader never stops
+        // Write however many bytes of foxes we have left, because the reader may not be 4-bytes
+        // aligned
+        // Without the following lines, running `dd if=/dev/foxes bs=3 count=12` outputs nothing
+        let remain = write_total - 4 * many_foxes;
+        writer.write_slice(&very[..remain])?;
+        Ok(written+remain) // If we always return n, n>0, the reader never stops
     }
 }
