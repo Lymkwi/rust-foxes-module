@@ -1,0 +1,1345 @@
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index ddb5644d4fd9..709186964a48 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -11,6 +11,7 @@
+ #include <linux/ethtool.h>
+ #include <linux/jiffies.h>
+ #include <linux/mdio.h>
++#include <linux/miscdevice.h>
+ #include <linux/phy.h>
+ #include <linux/refcount.h>
+ #include <linux/sched.h>
+diff --git a/rust/helpers.c b/rust/helpers.c
+index 2c37a0f5d7a8..3bc63be197cc 100644
+--- a/rust/helpers.c
++++ b/rust/helpers.c
+@@ -23,8 +23,11 @@
+ #include <kunit/test-bug.h>
+ #include <linux/bug.h>
+ #include <linux/build_bug.h>
++#include <linux/device.h>
+ #include <linux/err.h>
+ #include <linux/errname.h>
++#include <linux/fs.h>
++#include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/refcount.h>
+ #include <linux/sched/signal.h>
+@@ -33,6 +36,42 @@
+ #include <linux/wait.h>
+ #include <linux/workqueue.h>
+ 
++const char *rust_helper_dev_name(const struct device *dev)
++{
++	return dev_name(dev);
++}
++EXPORT_SYMBOL_GPL(rust_helper_dev_name);
++
++const char *rust_helper_module_name(struct module* module)
++{
++	return (const char*)module_name(module);
++}
++EXPORT_SYMBOL_GPL(rust_helper_module_name);
++
++unsigned long rust_helper_copy_from_user(void *to, const void __user *from, unsigned long n)
++{
++	return copy_from_user(to, from, n);
++}
++EXPORT_SYMBOL_GPL(rust_helper_copy_from_user);
++
++unsigned long rust_helper_copy_to_user(void __user *to, const void *from, unsigned long n)
++{
++	return copy_to_user(to, from, n);
++}
++EXPORT_SYMBOL_GPL(rust_helper_copy_to_user);
++
++unsigned long rust_helper_clear_user(void __user *to, unsigned long n)
++{
++	return clear_user(to, n);
++}
++EXPORT_SYMBOL_GPL(rust_helper_clear_user);
++
++struct file *rust_helper_get_file(struct file *f)
++{
++	return get_file(f);
++}
++EXPORT_SYMBOL_GPL(rust_helper_get_file);
++
+ __noreturn void rust_helper_BUG(void)
+ {
+ 	BUG();
+diff --git a/rust/kernel/device.rs b/rust/kernel/device.rs
+new file mode 100644
+index 000000000000..a5c641b7cddf
+--- /dev/null
++++ b/rust/kernel/device.rs
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Generic devices that are part of the kernel's driver model.
++//!
++//! C header: [`include/linux/device.h`](../../../../include/linux/device.h)
++
++use crate::{
++    bindings,
++    str::CStr,
++};
++
++/// A raw device.
++///
++/// # Safety
++///
++/// Implementers must ensure that the `*mut device` returned by [`RawDevice::raw_device`] is
++/// related to `self`, that is, actions on it will affect `self`. For example, if one calls
++/// `get_device`, then the refcount on the device represented by `self` will be incremented.
++///
++/// Additionally, implementers must ensure that the device is never renamed. Commit a5462516aa99
++/// ("driver-core: document restrictions on device_rename()") has details on why `device_rename`
++/// should not be used.
++pub unsafe trait RawDevice {
++    /// Returns the raw `struct device` related to `self`.
++    fn raw_device(&self) -> *mut bindings::device;
++
++    /// Returns the name of the device.
++    fn name(&self) -> &CStr {
++        let ptr = self.raw_device();
++
++        // SAFETY: `ptr` is valid because `self` keeps it alive.
++        let name = unsafe { bindings::dev_name(ptr) };
++
++        // SAFETY: The name of the device remains valid while it is alive (because the device is
++        // never renamed, per the safety requirement of this trait). This is guaranteed to be the
++        // case because the reference to `self` outlives the one of the returned `CStr` (enforced
++        // by the compiler because of their lifetimes).
++        unsafe { CStr::from_char_ptr(name) }
++    }
++}
+diff --git a/rust/kernel/file.rs b/rust/kernel/file.rs
+new file mode 100644
+index 000000000000..c5d45c6edc41
+--- /dev/null
++++ b/rust/kernel/file.rs
+@@ -0,0 +1,525 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Files and file descriptors.
++//!
++//! C headers: [`include/linux/fs.h`](../../../../include/linux/fs.h) and
++//! [`include/linux/file.h`](../../../../include/linux/file.h)
++
++use crate::{
++    bindings,
++    error::{code::*, from_result, Result},
++    io_buffer::IoBufferWriter,
++    types::ForeignOwnable,
++    user_ptr::{UserSlicePtr, UserSlicePtrReader, UserSlicePtrWriter},
++    types::{ARef, AlwaysRefCounted},
++};
++use core::{cell::UnsafeCell, marker, mem, ptr};
++use macros::vtable;
++
++/// Flags associated with a [`File`].
++pub mod flags {
++    /// File is opened in append mode.
++    pub const O_APPEND: u32 = bindings::O_APPEND;
++
++    /// Signal-driven I/O is enabled.
++    pub const O_ASYNC: u32 = bindings::FASYNC;
++
++    /// Close-on-exec flag is set.
++    pub const O_CLOEXEC: u32 = bindings::O_CLOEXEC;
++
++    /// File was created if it didn't already exist.
++    pub const O_CREAT: u32 = bindings::O_CREAT;
++
++    /// Direct I/O is enabled for this file.
++    pub const O_DIRECT: u32 = bindings::O_DIRECT;
++
++    /// File must be a directory.
++    pub const O_DIRECTORY: u32 = bindings::O_DIRECTORY;
++
++    /// Like [`O_SYNC`] except metadata is not synced.
++    pub const O_DSYNC: u32 = bindings::O_DSYNC;
++
++    /// Ensure that this file is created with the `open(2)` call.
++    pub const O_EXCL: u32 = bindings::O_EXCL;
++
++    /// Large file size enabled (`off64_t` over `off_t`).
++    pub const O_LARGEFILE: u32 = bindings::O_LARGEFILE;
++
++    /// Do not update the file last access time.
++    pub const O_NOATIME: u32 = bindings::O_NOATIME;
++
++    /// File should not be used as process's controlling terminal.
++    pub const O_NOCTTY: u32 = bindings::O_NOCTTY;
++
++    /// If basename of path is a symbolic link, fail open.
++    pub const O_NOFOLLOW: u32 = bindings::O_NOFOLLOW;
++
++    /// File is using nonblocking I/O.
++    pub const O_NONBLOCK: u32 = bindings::O_NONBLOCK;
++
++    /// Also known as `O_NDELAY`.
++    ///
++    /// This is effectively the same flag as [`O_NONBLOCK`] on all architectures
++    /// except SPARC64.
++    pub const O_NDELAY: u32 = bindings::O_NDELAY;
++
++    /// Used to obtain a path file descriptor.
++    pub const O_PATH: u32 = bindings::O_PATH;
++
++    /// Write operations on this file will flush data and metadata.
++    pub const O_SYNC: u32 = bindings::O_SYNC;
++
++    /// This file is an unnamed temporary regular file.
++    pub const O_TMPFILE: u32 = bindings::O_TMPFILE;
++
++    /// File should be truncated to length 0.
++    pub const O_TRUNC: u32 = bindings::O_TRUNC;
++
++    /// Bitmask for access mode flags.
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// use kernel::file;
++    /// # fn do_something() {}
++    /// # let flags = 0;
++    /// if (flags & file::flags::O_ACCMODE) == file::flags::O_RDONLY {
++    ///     do_something();
++    /// }
++    /// ```
++    pub const O_ACCMODE: u32 = bindings::O_ACCMODE;
++
++    /// File is read only.
++    pub const O_RDONLY: u32 = bindings::O_RDONLY;
++
++    /// File is write only.
++    pub const O_WRONLY: u32 = bindings::O_WRONLY;
++
++    /// File can be both read and written.
++    pub const O_RDWR: u32 = bindings::O_RDWR;
++}
++
++/// Wraps the kernel's `struct file`.
++///
++/// # Invariants
++///
++/// Instances of this type are always ref-counted, that is, a call to `get_file` ensures that the
++/// allocation remains valid at least until the matching call to `fput`.
++#[repr(transparent)]
++pub struct File(pub(crate) UnsafeCell<bindings::file>);
++
++// TODO: Accessing fields of `struct file` through the pointer is UB because other threads may be
++// writing to them. However, this is how the C code currently operates: naked reads and writes to
++// fields. Even if we used relaxed atomics on the Rust side, we can't force this on the C side.
++impl File {
++    /// Constructs a new [`struct file`] wrapper from a file descriptor.
++    ///
++    /// The file descriptor belongs to the current process.
++    pub fn from_fd(fd: u32) -> Result<ARef<Self>> {
++        // SAFETY: FFI call, there are no requirements on `fd`.
++        let ptr = ptr::NonNull::new(unsafe { bindings::fget(fd) }).ok_or(EBADF)?;
++
++        // SAFETY: `fget` increments the refcount before returning.
++        Ok(unsafe { ARef::from_raw(ptr.cast()) })
++    }
++
++    /// Creates a reference to a [`File`] from a valid pointer.
++    ///
++    /// # Safety
++    ///
++    /// The caller must ensure that `ptr` is valid and remains valid for the lifetime of the
++    /// returned [`File`] instance.
++    pub(crate) unsafe fn from_ptr<'a>(ptr: *const bindings::file) -> &'a File {
++        // SAFETY: The safety requirements guarantee the validity of the dereference, while the
++        // `File` type being transparent makes the cast ok.
++        unsafe { &*ptr.cast() }
++    }
++
++    /// Returns the current seek/cursor/pointer position (`struct file::f_pos`).
++    pub fn pos(&self) -> u64 {
++        // SAFETY: The file is valid because the shared reference guarantees a nonzero refcount.
++        unsafe { core::ptr::addr_of!((*self.0.get()).f_pos).read() as _ }
++    }
++
++    /// Returns the flags associated with the file.
++    ///
++    /// The flags are a combination of the constants in [`flags`].
++    pub fn flags(&self) -> u32 {
++        // SAFETY: The file is valid because the shared reference guarantees a nonzero refcount.
++        unsafe { core::ptr::addr_of!((*self.0.get()).f_flags).read() }
++    }
++}
++
++// SAFETY: The type invariants guarantee that `File` is always ref-counted.
++unsafe impl AlwaysRefCounted for File {
++    fn inc_ref(&self) {
++        // SAFETY: The existence of a shared reference means that the refcount is nonzero.
++        unsafe { bindings::get_file(self.0.get()) };
++    }
++
++    unsafe fn dec_ref(obj: ptr::NonNull<Self>) {
++        // SAFETY: The safety requirements guarantee that the refcount is nonzero.
++        unsafe { bindings::fput(obj.cast().as_ptr()) }
++    }
++}
++
++/// Equivalent to [`std::io::SeekFrom`].
++///
++/// [`std::io::SeekFrom`]: https://doc.rust-lang.org/std/io/enum.SeekFrom.html
++pub enum SeekFrom {
++    /// Equivalent to C's `SEEK_SET`.
++    Start(u64),
++
++    /// Equivalent to C's `SEEK_END`.
++    End(i64),
++
++    /// Equivalent to C's `SEEK_CUR`.
++    Current(i64),
++}
++
++pub(crate) struct OperationsVtable<A, T>(marker::PhantomData<A>, marker::PhantomData<T>);
++
++impl<A: OpenAdapter<T::OpenData>, T: Operations> OperationsVtable<A, T> {
++    /// Called by the VFS when an inode should be opened.
++    ///
++    /// Calls `T::open` on the returned value of `A::convert`.
++    ///
++    /// # Safety
++    ///
++    /// The returned value of `A::convert` must be a valid non-null pointer and
++    /// `T:open` must return a valid non-null pointer on an `Ok` result.
++    unsafe extern "C" fn open_callback(
++        inode: *mut bindings::inode,
++        file: *mut bindings::file,
++    ) -> core::ffi::c_int {
++        from_result(|| {
++            // SAFETY: `A::convert` must return a valid non-null pointer that
++            // should point to data in the inode or file that lives longer
++            // than the following use of `T::open`.
++            let arg = unsafe { A::convert(inode, file) };
++            // SAFETY: The C contract guarantees that `file` is valid. Additionally,
++            // `fileref` never outlives this function, so it is guaranteed to be
++            // valid.
++            let fileref = unsafe { File::from_ptr(file) };
++            // SAFETY: `arg` was previously returned by `A::convert` and must
++            // be a valid non-null pointer.
++            let ptr = T::open(unsafe { &*arg }, fileref)?.into_foreign();
++            // SAFETY: The C contract guarantees that `private_data` is available
++            // for implementers of the file operations (no other C code accesses
++            // it), so we know that there are no concurrent threads/CPUs accessing
++            // it (it's not visible to any other Rust code).
++            unsafe { (*file).private_data = ptr as *mut core::ffi::c_void };
++            Ok(0)
++        })
++    }
++
++    unsafe extern "C" fn read_callback(
++        file: *mut bindings::file,
++        buf: *mut core::ffi::c_char,
++        len: usize,
++        offset: *mut bindings::loff_t,
++    ) -> isize {
++        from_result(|| {
++            let mut data =
++                unsafe { UserSlicePtr::new(buf as *mut core::ffi::c_void, len).writer() };
++            // SAFETY: `private_data` was initialised by `open_callback` with a value returned by
++            // `T::Data::into_foreign`. `T::Data::from_foreign` is only called by the
++            // `release` callback, which the C API guarantees that will be called only when all
++            // references to `file` have been released, so we know it can't be called while this
++            // function is running.
++            let f = unsafe { T::Data::borrow((*file).private_data) };
++            // No `FMODE_UNSIGNED_OFFSET` support, so `offset` must be in [0, 2^63).
++            // See <https://github.com/fishinabarrel/linux-kernel-module-rust/pull/113>.
++            let read = T::read(
++                f,
++                unsafe { File::from_ptr(file) },
++                &mut data,
++                unsafe { *offset }.try_into()?,
++            )?;
++            unsafe { (*offset) += bindings::loff_t::try_from(read).unwrap() };
++            Ok(read as _)
++        })
++    }
++
++    unsafe extern "C" fn release_callback(
++        _inode: *mut bindings::inode,
++        file: *mut bindings::file,
++    ) -> core::ffi::c_int {
++        let ptr = mem::replace(unsafe { &mut (*file).private_data }, ptr::null_mut());
++        T::release(unsafe { T::Data::from_foreign(ptr as _) }, unsafe {
++            File::from_ptr(file)
++        });
++        0
++    }
++
++
++    unsafe extern "C" fn unlocked_ioctl_callback(
++        file: *mut bindings::file,
++        cmd: core::ffi::c_uint,
++        arg: core::ffi::c_ulong,
++    ) -> core::ffi::c_long {
++        from_result(|| {
++            // SAFETY: `private_data` was initialised by `open_callback` with a value returned by
++            // `T::Data::into_foreign`. `T::Data::from_foreign` is only called by the
++            // `release` callback, which the C API guarantees that will be called only when all
++            // references to `file` have been released, so we know it can't be called while this
++            // function is running.
++            let f = unsafe { T::Data::borrow((*file).private_data) };
++            let mut cmd = IoctlCommand::new(cmd as _, arg as _);
++            let ret = T::ioctl(f, unsafe { File::from_ptr(file) }, &mut cmd)?;
++            Ok(ret as _)
++        })
++    }
++
++    unsafe extern "C" fn compat_ioctl_callback(
++        file: *mut bindings::file,
++        cmd: core::ffi::c_uint,
++        arg: core::ffi::c_ulong,
++    ) -> core::ffi::c_long {
++        from_result(|| {
++            // SAFETY: `private_data` was initialised by `open_callback` with a value returned by
++            // `T::Data::into_foreign`. `T::Data::from_foreign` is only called by the
++            // `release` callback, which the C API guarantees that will be called only when all
++            // references to `file` have been released, so we know it can't be called while this
++            // function is running.
++            let f = unsafe { T::Data::borrow((*file).private_data) };
++            let mut cmd = IoctlCommand::new(cmd as _, arg as _);
++            let ret = T::compat_ioctl(f, unsafe { File::from_ptr(file) }, &mut cmd)?;
++            Ok(ret as _)
++        })
++    }
++
++    const VTABLE: bindings::file_operations = bindings::file_operations {
++        open: Some(Self::open_callback),
++        release: Some(Self::release_callback),
++        read: if T::HAS_READ {
++            Some(Self::read_callback)
++        } else {
++            None
++        },
++        write: None,
++        llseek: None,
++
++        check_flags: None,
++        compat_ioctl: if <T>::HAS_COMPAT_IOCTL { Some(Self::compat_ioctl_callback) } else { None },
++        copy_file_range: None,
++        fallocate: None,
++        fadvise: None,
++        fasync: None,
++        flock: None,
++        flush: None,
++        fsync: None,
++        get_unmapped_area: None,
++        iterate_shared: None,
++        iopoll: None,
++        lock: None,
++        mmap: None,
++        owner: ptr::null_mut(),
++        poll: None,
++        read_iter: None,
++        remap_file_range: None,
++        setlease: None,
++        show_fdinfo: None,
++        splice_read: None,
++        splice_write: None,
++        unlocked_ioctl: if <T>::HAS_IOCTL { Some(Self::unlocked_ioctl_callback) } else { None },
++        uring_cmd: None,
++        uring_cmd_iopoll: None,
++        write_iter: None,
++        fop_flags: 0,
++        splice_eof: None,
++    };
++
++    /// Builds an instance of [`struct file_operations`].
++    ///
++    /// # Safety
++    ///
++    /// The caller must ensure that the adapter is compatible with the way the device is registered.
++    pub(crate) const unsafe fn build() -> &'static bindings::file_operations {
++        &Self::VTABLE
++    }
++}
++
++/// Allows the handling of ioctls defined with the `_IO`, `_IOR`, `_IOW`, and `_IOWR` macros.
++///
++/// For each macro, there is a handler function that takes the appropriate types as arguments.
++pub trait IoctlHandler: Sync {
++    /// The type of the first argument to each associated function.
++    type Target<'a>;
++
++    /// Handles ioctls defined with the `_IO` macro, that is, with no buffer as argument.
++    fn pure(_this: Self::Target<'_>, _file: &File, _cmd: u32, _arg: usize) -> Result<i32> {
++        Err(EINVAL)
++    }
++
++    /// Handles ioctls defined with the `_IOR` macro, that is, with an output buffer provided as
++    /// argument.
++    fn read(
++        _this: Self::Target<'_>,
++        _file: &File,
++        _cmd: u32,
++        _writer: &mut UserSlicePtrWriter,
++    ) -> Result<i32> {
++        Err(EINVAL)
++    }
++
++    /// Handles ioctls defined with the `_IOW` macro, that is, with an input buffer provided as
++    /// argument.
++    fn write(
++        _this: Self::Target<'_>,
++        _file: &File,
++        _cmd: u32,
++        _reader: &mut UserSlicePtrReader,
++    ) -> Result<i32> {
++        Err(EINVAL)
++    }
++
++    /// Handles ioctls defined with the `_IOWR` macro, that is, with a buffer for both input and
++    /// output provided as argument.
++    fn read_write(
++        _this: Self::Target<'_>,
++        _file: &File,
++        _cmd: u32,
++        _data: UserSlicePtr,
++    ) -> Result<i32> {
++        Err(EINVAL)
++    }
++}
++
++/// Represents an ioctl command.
++///
++/// It can use the components of an ioctl command to dispatch ioctls using
++/// [`IoctlCommand::dispatch`].
++pub struct IoctlCommand {
++    cmd: u32,
++    arg: usize,
++    user_slice: Option<UserSlicePtr>,
++}
++
++impl IoctlCommand {
++    /// Constructs a new [`IoctlCommand`].
++    fn new(cmd: u32, arg: usize) -> Self {
++        let size = (cmd >> bindings::_IOC_SIZESHIFT) & bindings::_IOC_SIZEMASK;
++
++        // SAFETY: We only create one instance of the user slice per ioctl call, so TOCTOU issues
++        // are not possible.
++        let user_slice = Some(unsafe { UserSlicePtr::new(arg as _, size as _) });
++        Self {
++            cmd,
++            arg,
++            user_slice,
++        }
++    }
++
++    /// Dispatches the given ioctl to the appropriate handler based on the value of the command. It
++    /// also creates a [`UserSlicePtr`], [`UserSlicePtrReader`], or [`UserSlicePtrWriter`]
++    /// depending on the direction of the buffer of the command.
++    ///
++    /// It is meant to be used in implementations of [`Operations::ioctl`] and
++    /// [`Operations::compat_ioctl`].
++    pub fn dispatch<T: IoctlHandler>(
++        &mut self,
++        handler: T::Target<'_>,
++        file: &File,
++    ) -> Result<i32> {
++        let dir = (self.cmd >> bindings::_IOC_DIRSHIFT) & bindings::_IOC_DIRMASK;
++        if dir == bindings::_IOC_NONE {
++            return T::pure(handler, file, self.cmd, self.arg);
++        }
++
++        let data = self.user_slice.take().ok_or(EINVAL)?;
++        const READ_WRITE: u32 = bindings::_IOC_READ | bindings::_IOC_WRITE;
++        match dir {
++            bindings::_IOC_WRITE => T::write(handler, file, self.cmd, &mut data.reader()),
++            bindings::_IOC_READ => T::read(handler, file, self.cmd, &mut data.writer()),
++            READ_WRITE => T::read_write(handler, file, self.cmd, data),
++            _ => Err(EINVAL),
++        }
++    }
++
++    /// Returns the raw 32-bit value of the command and the ptr-sized argument.
++    pub fn raw(&self) -> (u32, usize) {
++        (self.cmd, self.arg)
++    }
++}
++
++/// Trait for extracting file open arguments from kernel data structures.
++///
++/// This is meant to be implemented by registration managers.
++pub trait OpenAdapter<T: Sync> {
++    /// Converts untyped data stored in [`struct inode`] and [`struct file`] (when [`struct
++    /// file_operations::open`] is called) into the given type. For example, for `miscdev`
++    /// devices, a pointer to the registered [`struct miscdev`] is stored in [`struct
++    /// file::private_data`].
++    ///
++    /// # Safety
++    ///
++    /// This function must be called only when [`struct file_operations::open`] is being called for
++    /// a file that was registered by the implementer. The returned pointer must be valid and
++    /// not-null.
++    unsafe fn convert(_inode: *mut bindings::inode, _file: *mut bindings::file) -> *const T;
++}
++
++/// Corresponds to the kernel's `struct file_operations`.
++///
++/// You implement this trait whenever you would create a `struct file_operations`.
++///
++/// File descriptors may be used from multiple threads/processes concurrently, so your type must be
++/// [`Sync`]. It must also be [`Send`] because [`Operations::release`] will be called from the
++/// thread that decrements that associated file's refcount to zero.
++#[vtable]
++pub trait Operations {
++    /// The type of the context data returned by [`Operations::open`] and made available to
++    /// other methods.
++    type Data: ForeignOwnable + Send + Sync = ();
++
++    /// The type of the context data passed to [`Operations::open`].
++    type OpenData: Sync = ();
++
++    /// Creates a new instance of this file.
++    ///
++    /// Corresponds to the `open` function pointer in `struct file_operations`.
++    fn open(context: &Self::OpenData, file: &File) -> Result<Self::Data>;
++
++    /// Cleans up after the last reference to the file goes away.
++    ///
++    /// Note that context data is moved, so it will be freed automatically unless the
++    /// implementation moves it elsewhere.
++    ///
++    /// Corresponds to the `release` function pointer in `struct file_operations`.
++    fn release(_data: Self::Data, _file: &File) {}
++
++    /// Reads data from this file to the caller's buffer.
++    ///
++    /// Corresponds to the `read` and `read_iter` function pointers in `struct file_operations`.
++    fn read(
++        _data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
++        _file: &File,
++        _writer: &mut impl IoBufferWriter,
++        _offset: u64,
++    ) -> Result<usize> {
++        Err(EINVAL)
++    }
++
++    /// Performs IO control operations that are specific to the file.
++    ///
++    /// Corresponds to the `unlocked_ioctl` function pointer in `struct file_operations`.
++    fn ioctl(
++        _data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
++        _file: &File,
++        _cmd: &mut IoctlCommand,
++    ) -> Result<i32> {
++        Err(ENOTTY)
++    }
++
++    /// Performs 32-bit IO control operations on that are specific to the file on 64-bit kernels.
++    ///
++    /// Corresponds to the `compat_ioctl` function pointer in `struct file_operations`.
++    fn compat_ioctl(
++        _data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
++        _file: &File,
++        _cmd: &mut IoctlCommand,
++    ) -> Result<i32> {
++        Err(ENOTTY)
++    }
++}
+diff --git a/rust/kernel/io_buffer.rs b/rust/kernel/io_buffer.rs
+new file mode 100644
+index 000000000000..c96fffa91668
+--- /dev/null
++++ b/rust/kernel/io_buffer.rs
+@@ -0,0 +1,155 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Buffers used in IO.
++
++use crate::prelude::*;
++use crate::alloc::flags::GFP_KERNEL;
++use crate::error::Result;
++use core::mem::{size_of, MaybeUninit};
++
++/// Represents a buffer to be read from during IO.
++pub trait IoBufferReader {
++    /// Returns the number of bytes left to be read from the io buffer.
++    ///
++    /// Note that even reading less than this number of bytes may fail.
++    fn len(&self) -> usize;
++
++    /// Returns `true` if no data is available in the io buffer.
++    fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++
++    /// Reads raw data from the io buffer into a raw kernel buffer.
++    ///
++    /// # Safety
++    ///
++    /// The output buffer must be valid.
++    unsafe fn read_raw(&mut self, out: *mut u8, len: usize) -> Result;
++
++    /// Reads all data remaining in the io buffer.
++    ///
++    /// Returns `EFAULT` if the address does not currently point to mapped, readable memory.
++    fn read_all(&mut self) -> Result<Vec<u8>> {
++        let mut data = Vec::<u8>::new();
++        data.reserve(self.len(), GFP_KERNEL)?;
++
++        // SAFETY: The output buffer is valid as we just allocated it.
++        unsafe { self.read_raw(data.as_mut_ptr(), data.len())? };
++        Ok(data)
++    }
++
++    /// Reads a byte slice from the io buffer.
++    ///
++    /// Returns `EFAULT` if the byte slice is bigger than the remaining size of the user slice or
++    /// if the address does not currently point to mapped, readable memory.
++    fn read_slice(&mut self, data: &mut [u8]) -> Result {
++        // SAFETY: The output buffer is valid as it's coming from a live reference.
++        unsafe { self.read_raw(data.as_mut_ptr(), data.len()) }
++    }
++
++    /// Reads the contents of a plain old data (POD) type from the io buffer.
++    fn read<T: ReadableFromBytes>(&mut self) -> Result<T> {
++        let mut out = MaybeUninit::<T>::uninit();
++        // SAFETY: The buffer is valid as it was just allocated.
++        unsafe { self.read_raw(out.as_mut_ptr() as _, size_of::<T>()) }?;
++        // SAFETY: We just initialised the data.
++        Ok(unsafe { out.assume_init() })
++    }
++}
++
++/// Represents a buffer to be written to during IO.
++pub trait IoBufferWriter {
++    /// Returns the number of bytes left to be written into the io buffer.
++    ///
++    /// Note that even writing less than this number of bytes may fail.
++    fn len(&self) -> usize;
++
++    /// Returns `true` if the io buffer cannot hold any additional data.
++    fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++
++    /// Writes zeroes to the io buffer.
++    ///
++    /// Differently from the other write functions, `clear` will zero as much as it can and update
++    /// the writer internal state to reflect this. It will, however, return an error if it cannot
++    /// clear `len` bytes.
++    ///
++    /// For example, if a caller requests that 100 bytes be cleared but a segfault happens after
++    /// 20 bytes, then EFAULT is returned and the writer is advanced by 20 bytes.
++    fn clear(&mut self, len: usize) -> Result;
++
++    /// Writes a byte slice into the io buffer.
++    ///
++    /// Returns `EFAULT` if the byte slice is bigger than the remaining size of the io buffer or if
++    /// the address does not currently point to mapped, writable memory.
++    fn write_slice(&mut self, data: &[u8]) -> Result {
++        // SAFETY: The input buffer is valid as it's coming from a live reference.
++        unsafe { self.write_raw(data.as_ptr(), data.len()) }
++    }
++
++    /// Writes raw data to the io buffer from a raw kernel buffer.
++    ///
++    /// # Safety
++    ///
++    /// The input buffer must be valid.
++    unsafe fn write_raw(&mut self, data: *const u8, len: usize) -> Result;
++
++    /// Writes the contents of the given data into the io buffer.
++    fn write<T: WritableToBytes>(&mut self, data: &T) -> Result {
++        // SAFETY: The input buffer is valid as it's coming from a live
++        // reference to a type that implements `WritableToBytes`.
++        unsafe { self.write_raw(data as *const T as _, size_of::<T>()) }
++    }
++}
++
++/// Specifies that a type is safely readable from byte slices.
++///
++/// Not all types can be safely read from byte slices; examples from
++/// <https://doc.rust-lang.org/reference/behavior-considered-undefined.html> include `bool`
++/// that must be either `0` or `1`, and `char` that cannot be a surrogate or above `char::MAX`.
++///
++/// # Safety
++///
++/// Implementers must ensure that the type is made up only of types that can be safely read from
++/// arbitrary byte sequences (e.g., `u32`, `u64`, etc.).
++pub unsafe trait ReadableFromBytes {}
++
++// SAFETY: All bit patterns are acceptable values of the types below.
++unsafe impl ReadableFromBytes for u8 {}
++unsafe impl ReadableFromBytes for u16 {}
++unsafe impl ReadableFromBytes for u32 {}
++unsafe impl ReadableFromBytes for u64 {}
++unsafe impl ReadableFromBytes for usize {}
++unsafe impl ReadableFromBytes for i8 {}
++unsafe impl ReadableFromBytes for i16 {}
++unsafe impl ReadableFromBytes for i32 {}
++unsafe impl ReadableFromBytes for i64 {}
++unsafe impl ReadableFromBytes for isize {}
++
++/// Specifies that a type is safely writable to byte slices.
++///
++/// This means that we don't read undefined values (which leads to UB) in preparation for writing
++/// to the byte slice. It also ensures that no potentially sensitive information is leaked into the
++/// byte slices.
++///
++/// # Safety
++///
++/// A type must not include padding bytes and must be fully initialised to safely implement
++/// [`WritableToBytes`] (i.e., it doesn't contain [`MaybeUninit`] fields). A composition of
++/// writable types in a structure is not necessarily writable because it may result in padding
++/// bytes.
++pub unsafe trait WritableToBytes {}
++
++// SAFETY: Initialised instances of the following types have no uninitialised portions.
++unsafe impl WritableToBytes for u8 {}
++unsafe impl WritableToBytes for u16 {}
++unsafe impl WritableToBytes for u32 {}
++unsafe impl WritableToBytes for u64 {}
++unsafe impl WritableToBytes for usize {}
++unsafe impl WritableToBytes for i8 {}
++unsafe impl WritableToBytes for i16 {}
++unsafe impl WritableToBytes for i32 {}
++unsafe impl WritableToBytes for i64 {}
++unsafe impl WritableToBytes for isize {}
++
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index fbd91a48ff8b..c12c2067142e 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -17,6 +17,7 @@
+ #![feature(new_uninit)]
+ #![feature(receiver_trait)]
+ #![feature(unsize)]
++#![feature(associated_type_defaults)]
+ 
+ // Ensure conditional compilation based on the kernel configuration works;
+ // otherwise we may silently break things like initcall handling.
+@@ -28,11 +29,15 @@
+ 
+ pub mod alloc;
+ mod build_assert;
++pub mod device;
+ pub mod error;
++pub mod file;
+ pub mod init;
++pub mod io_buffer;
+ pub mod ioctl;
+ #[cfg(CONFIG_KUNIT)]
+ pub mod kunit;
++pub mod miscdev;
+ #[cfg(CONFIG_NET)]
+ pub mod net;
+ pub mod prelude;
+@@ -45,6 +50,7 @@
+ pub mod task;
+ pub mod time;
+ pub mod types;
++pub mod user_ptr;
+ pub mod workqueue;
+ 
+ #[doc(hidden)]
+@@ -95,6 +101,11 @@ impl ThisModule {
+     pub const fn as_ptr(&self) -> *mut bindings::module {
+         self.0
+     }
++
++    /// Retrieve the name of the module
++    pub fn get_name(&self) -> &'static str::CStr {
++        unsafe { str::CStr::from_char_ptr(bindings::module_name(self.0)) }
++    }
+ }
+ 
+ #[cfg(not(any(testlib, test)))]
+@@ -133,6 +144,6 @@ macro_rules! container_of {
+     ($ptr:expr, $type:ty, $($f:tt)*) => {{
+         let ptr = $ptr as *const _ as *const u8;
+         let offset: usize = ::core::mem::offset_of!($type, $($f)*);
+-        ptr.sub(offset) as *const $type
++        unsafe { ptr.sub(offset)  as *const $type }
+     }}
+ }
+diff --git a/rust/kernel/miscdev.rs b/rust/kernel/miscdev.rs
+new file mode 100644
+index 000000000000..0031769199d5
+--- /dev/null
++++ b/rust/kernel/miscdev.rs
+@@ -0,0 +1,292 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Miscellaneous devices.
++//!
++//! C header: [`include/linux/miscdevice.h`](../../../../include/linux/miscdevice.h)
++//!
++//! Reference: <https://www.kernel.org/doc/html/latest/driver-api/misc_devices.html>
++
++use crate::bindings;
++use crate::error::{code::*, Error, Result};
++use crate::file;
++use crate::{device, str::CString, ThisModule};
++use crate::prelude::*;
++use core::marker::PhantomPinned;
++use core::{fmt, mem::MaybeUninit, pin::Pin};
++
++/// Options which can be used to configure how a misc device is registered.
++///
++/// # Examples
++///
++/// ```
++/// # use kernel::{c_str, device::RawDevice, file, miscdev, prelude::*};
++/// fn example(
++///     reg: Pin<&mut miscdev::Registration<impl file::Operations<OpenData = ()>>>,
++///     parent: &dyn RawDevice,
++/// ) -> Result {
++///     miscdev::Options::new()
++///         .mode(0o600)
++///         .minor(10)
++///         .parent(parent)
++///         .register(reg, fmt!("sample"), ())
++/// }
++/// ```
++#[derive(Default)]
++pub struct Options<'a> {
++    minor: Option<i32>,
++    mode: Option<u16>,
++    parent: Option<&'a dyn device::RawDevice>,
++}
++
++impl<'a> Options<'a> {
++    /// Creates new [`Options`] instance with the required fields.
++    pub const fn new() -> Self {
++        Self {
++            minor: None,
++            mode: None,
++            parent: None,
++        }
++    }
++
++    /// Sets the minor device number.
++    pub fn minor(&mut self, v: i32) -> &mut Self {
++        self.minor = Some(v);
++        self
++    }
++
++    /// Sets the device mode.
++    ///
++    /// This is usually an octal number and describes who can perform read/write/execute operations
++    /// on the device.
++    pub fn mode(&mut self, m: u16) -> &mut Self {
++        self.mode = Some(m);
++        self
++    }
++
++    /// Sets the device parent.
++    pub fn parent(&mut self, p: &'a dyn device::RawDevice) -> &mut Self {
++        self.parent = Some(p);
++        self
++    }
++
++    /// Registers a misc device using the configured options.
++    pub fn register<T: file::Operations>(
++        &self,
++        reg: Pin<&mut Registration<T>>,
++        name: fmt::Arguments<'_>,
++        open_data: T::OpenData,
++    ) -> Result {
++        reg.register_with_options(name, open_data, self)
++    }
++
++    /// Allocates a new registration of a misc device and completes the registration with the
++    /// configured options.
++    pub fn register_new<T: file::Operations>(
++        &self,
++        name: fmt::Arguments<'_>,
++        open_data: T::OpenData,
++    ) -> Result<Pin<Box<Registration<T>>>> {
++        let mut r: Pin<Box<Registration<T>>> = Pin::from(Box::new(Registration::new(), crate::alloc::flags::GFP_KERNEL)?);
++        self.register(r.as_mut(), name, open_data)?;
++        Ok(r)
++    }
++}
++
++/// A registration of a miscellaneous device.
++//e
++/// # Invariants
++///
++/// `Context` is always initialised when `registered` is `true`, and not initialised otherwise.
++pub struct Registration<T: file::Operations> {
++    registered: bool,
++    mdev: bindings::miscdevice,
++    name: Option<CString>,
++    _pin: PhantomPinned,
++
++    /// Context initialised on construction and made available to all file instances on
++    /// [`file::Operations::open`].
++    open_data: MaybeUninit<T::OpenData>,
++}
++
++impl<T: file::Operations> Registration<T> {
++    /// Creates a new [`Registration`] but does not register it yet.
++    ///
++    /// It is allowed to move.
++    pub fn new() -> Self {
++        // INVARIANT: `registered` is `false` and `open_data` is not initialised.
++        Self {
++            registered: false,
++            mdev: bindings::miscdevice::default(),
++            name: None,
++            _pin: PhantomPinned,
++            open_data: MaybeUninit::uninit(),
++        }
++    }
++
++    /// Registers a miscellaneous device.
++    ///
++    /// Returns a pinned heap-allocated representation of the registration.
++    pub fn new_pinned(name: fmt::Arguments<'_>, open_data: T::OpenData) -> Result<Pin<Box<Self>>> {
++        Options::new().register_new(name, open_data)
++    }
++
++    /// Registers a miscellaneous device with the rest of the kernel.
++    ///
++    /// It must be pinned because the memory block that represents the registration is
++    /// self-referential.
++    pub fn register(
++        self: Pin<&mut Self>,
++        name: fmt::Arguments<'_>,
++        open_data: T::OpenData,
++    ) -> Result {
++        Options::new().register(self, name, open_data)
++    }
++
++    /// Registers a miscellaneous device with the rest of the kernel. Additional optional settings
++    /// are provided via the `opts` parameter.
++    ///
++    /// It must be pinned because the memory block that represents the registration is
++    /// self-referential.
++    pub fn register_with_options(
++        self: Pin<&mut Self>,
++        name: fmt::Arguments<'_>,
++        open_data: T::OpenData,
++        opts: &Options<'_>,
++    ) -> Result {
++        // SAFETY: We must ensure that we never move out of `this`.
++        let this = unsafe { self.get_unchecked_mut() };
++        if this.registered {
++            // Already registered.
++            return Err(EINVAL);
++        }
++
++        let name = CString::try_from_fmt(name)?;
++
++        // SAFETY: The adapter is compatible with `misc_register`.
++        this.mdev.fops = unsafe { file::OperationsVtable::<Self, T>::build() };
++        this.mdev.name = name.as_char_ptr();
++        this.mdev.minor = opts.minor.unwrap_or(bindings::MISC_DYNAMIC_MINOR as i32);
++        this.mdev.mode = opts.mode.unwrap_or(0);
++        this.mdev.parent = opts
++            .parent
++            .map_or(core::ptr::null_mut(), |p| p.raw_device());
++
++        // We write to `open_data` here because as soon as `misc_register` succeeds, the file can be
++        // opened, so we need `open_data` configured ahead of time.
++        //
++        // INVARIANT: `registered` is set to `true`, but `open_data` is also initialised.
++        this.registered = true;
++        this.open_data.write(open_data);
++
++        let ret = unsafe { bindings::misc_register(&mut this.mdev) };
++        if ret < 0 {
++            // INVARIANT: `registered` is set back to `false` and the `open_data` is destructued.
++            this.registered = false;
++            // SAFETY: `open_data` was initialised a few lines above.
++            unsafe { this.open_data.assume_init_drop() };
++            return Err(Error::from_errno(ret));
++        }
++
++        this.name = Some(name);
++
++        Ok(())
++    }
++}
++
++impl<T: file::Operations> Default for Registration<T> {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl<T: file::Operations> file::OpenAdapter<T::OpenData> for Registration<T> {
++    unsafe fn convert(
++        _inode: *mut bindings::inode,
++        file: *mut bindings::file,
++    ) -> *const T::OpenData {
++        // SAFETY: The caller must guarantee that `file` is valid.
++        let reg = crate::container_of!(unsafe { (*file).private_data }, Self, mdev);
++
++        // SAFETY: This function is only called while the misc device is still registered, so the
++        // registration must be valid. Additionally, the type invariants guarantee that while the
++        // miscdev is registered, `open_data` is initialised.
++        unsafe { (*reg).open_data.as_ptr() }
++    }
++}
++
++// SAFETY: The only method is `register()`, which requires a (pinned) mutable `Registration`, so it
++// is safe to pass `&Registration` to multiple threads because it offers no interior mutability.
++unsafe impl<T: file::Operations> Sync for Registration<T> {}
++
++// SAFETY: All functions work from any thread. So as long as the `Registration::open_data` is
++// `Send`, so is `Registration<T>`.
++unsafe impl<T: file::Operations> Send for Registration<T> where T::OpenData: Send {}
++
++impl<T: file::Operations> Drop for Registration<T> {
++    /// Removes the registration from the kernel if it has completed successfully before.
++    fn drop(&mut self) {
++        if self.registered {
++            // SAFETY: `registered` being `true` indicates that a previous call to  `misc_register`
++            // succeeded.
++            unsafe { bindings::misc_deregister(&mut self.mdev) };
++
++            // SAFETY: The type invariant guarantees that `open_data` is initialised when
++            // `registered` is `true`.
++            unsafe { self.open_data.assume_init_drop() };
++        }
++    }
++}
++
++/// Kernel module that exposes a single miscdev device implemented by `T`.
++pub struct Module<T: file::Operations<OpenData = ()>> {
++    _dev: Pin<Box<Registration<T>>>,
++}
++
++impl<T: file::Operations<OpenData = ()>> crate::Module for Module<T> {
++    fn init(module: &'static ThisModule) -> Result<Self> {
++        let name = module.get_name();
++        Ok(Self {
++            _dev: Registration::new_pinned(crate::fmt!("{name}"), ())?,
++        })
++    }
++}
++
++/// Declares a kernel module that exposes a single misc device.
++///
++/// The `type` argument should be a type which implements the [`FileOpener`] trait. Also accepts
++/// various forms of kernel metadata.
++///
++/// C header: [`include/linux/moduleparam.h`](../../../include/linux/moduleparam.h)
++///
++/// [`FileOpener`]: ../kernel/file_operations/trait.FileOpener.html
++///
++/// # Examples
++///
++/// ```ignore
++/// use kernel::prelude::*;
++///
++/// module_misc_device! {
++///     type: MyFile,
++///     name: "my_miscdev_kernel_module",
++///     author: "Rust for Linux Contributors",
++///     description: "My very own misc device kernel module!",
++///     license: "GPL",
++/// }
++///
++/// #[derive(Default)]
++/// struct MyFile;
++///
++/// #[vtable]
++/// impl kernel::file::Operations for MyFile {}
++/// ```
++#[macro_export]
++macro_rules! module_misc_device {
++    (type: $type:ty, $($f:tt)*) => {
++        type ModuleType = kernel::miscdev::Module<$type>;
++        module! {
++            type: ModuleType,
++            $($f)*
++        }
++    }
++}
++
+diff --git a/rust/kernel/user_ptr.rs b/rust/kernel/user_ptr.rs
+new file mode 100644
+index 000000000000..fa34a384dfd4
+--- /dev/null
++++ b/rust/kernel/user_ptr.rs
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! User pointers.
++//!
++//! C header: [`include/linux/uaccess.h`](../../../../include/linux/uaccess.h)
++
++use crate::{
++    bindings,
++    error::code::*,
++    io_buffer::{IoBufferReader, IoBufferWriter},
++    error::Result,
++};
++use alloc::vec::Vec;
++
++/// A reference to an area in userspace memory, which can be either
++/// read-only or read-write.
++///
++/// All methods on this struct are safe: invalid pointers return
++/// `EFAULT`. Concurrent access, *including data races to/from userspace
++/// memory*, is permitted, because fundamentally another userspace
++/// thread/process could always be modifying memory at the same time
++/// (in the same way that userspace Rust's [`std::io`] permits data races
++/// with the contents of files on disk). In the presence of a race, the
++/// exact byte values read/written are unspecified but the operation is
++/// well-defined. Kernelspace code should validate its copy of data
++/// after completing a read, and not expect that multiple reads of the
++/// same address will return the same value.
++///
++/// All APIs enforce the invariant that a given byte of memory from userspace
++/// may only be read once. By preventing double-fetches we avoid TOCTOU
++/// vulnerabilities. This is accomplished by taking `self` by value to prevent
++/// obtaining multiple readers on a given [`UserSlicePtr`], and the readers
++/// only permitting forward reads.
++///
++/// Constructing a [`UserSlicePtr`] performs no checks on the provided
++/// address and length, it can safely be constructed inside a kernel thread
++/// with no current userspace process. Reads and writes wrap the kernel APIs
++/// `copy_from_user` and `copy_to_user`, which check the memory map of the
++/// current process and enforce that the address range is within the user
++/// range (no additional calls to `access_ok` are needed).
++///
++/// [`std::io`]: https://doc.rust-lang.org/std/io/index.html
++pub struct UserSlicePtr(*mut core::ffi::c_void, usize);
++
++impl UserSlicePtr {
++    /// Constructs a user slice from a raw pointer and a length in bytes.
++    ///
++    /// # Safety
++    ///
++    /// Callers must be careful to avoid time-of-check-time-of-use
++    /// (TOCTOU) issues. The simplest way is to create a single instance of
++    /// [`UserSlicePtr`] per user memory block as it reads each byte at
++    /// most once.
++    pub unsafe fn new(ptr: *mut core::ffi::c_void, length: usize) -> Self {
++        UserSlicePtr(ptr, length)
++    }
++
++    /// Reads the entirety of the user slice.
++    ///
++    /// Returns `EFAULT` if the address does not currently point to
++    /// mapped, readable memory.
++    pub fn read_all(self) -> Result<Vec<u8>> {
++        self.reader().read_all()
++    }
++
++    /// Constructs a [`UserSlicePtrReader`].
++    pub fn reader(self) -> UserSlicePtrReader {
++        UserSlicePtrReader(self.0, self.1)
++    }
++
++    /// Writes the provided slice into the user slice.
++    ///
++    /// Returns `EFAULT` if the address does not currently point to
++    /// mapped, writable memory (in which case some data from before the
++    /// fault may be written), or `data` is larger than the user slice
++    /// (in which case no data is written).
++    pub fn write_all(self, data: &[u8]) -> Result {
++        self.writer().write_slice(data)
++    }
++
++    /// Constructs a [`UserSlicePtrWriter`].
++    pub fn writer(self) -> UserSlicePtrWriter {
++        UserSlicePtrWriter(self.0, self.1)
++    }
++
++    /// Constructs both a [`UserSlicePtrReader`] and a [`UserSlicePtrWriter`].
++    pub fn reader_writer(self) -> (UserSlicePtrReader, UserSlicePtrWriter) {
++        (
++            UserSlicePtrReader(self.0, self.1),
++            UserSlicePtrWriter(self.0, self.1),
++        )
++    }
++}
++
++/// A reader for [`UserSlicePtr`].
++///
++/// Used to incrementally read from the user slice.
++pub struct UserSlicePtrReader(*mut core::ffi::c_void, usize);
++
++impl IoBufferReader for UserSlicePtrReader {
++    /// Returns the number of bytes left to be read from this.
++    ///
++    /// Note that even reading less than this number of bytes may fail.
++    fn len(&self) -> usize {
++        self.1
++    }
++
++    /// Reads raw data from the user slice into a raw kernel buffer.
++    ///
++    /// # Safety
++    ///
++    /// The output buffer must be valid.
++    unsafe fn read_raw(&mut self, out: *mut u8, len: usize) -> Result {
++        if len > self.1 || len > u32::MAX as usize {
++            return Err(EFAULT);
++        }
++        let res = unsafe { bindings::copy_from_user(out as _, self.0, len as _) };
++        if res != 0 {
++            return Err(EFAULT);
++        }
++        // Since this is not a pointer to a valid object in our program,
++        // we cannot use `add`, which has C-style rules for defined
++        // behavior.
++        self.0 = self.0.wrapping_add(len);
++        self.1 -= len;
++        Ok(())
++    }
++}
++
++/// A writer for [`UserSlicePtr`].
++///
++/// Used to incrementally write into the user slice.
++pub struct UserSlicePtrWriter(*mut core::ffi::c_void, usize);
++
++impl IoBufferWriter for UserSlicePtrWriter {
++    fn len(&self) -> usize {
++        self.1
++    }
++
++    fn clear(&mut self, mut len: usize) -> Result {
++        let mut ret = Ok(());
++        if len > self.1 {
++            ret = Err(EFAULT);
++            len = self.1;
++        }
++
++        // SAFETY: The buffer will be validated by `clear_user`. We ensure that `len` is within
++        // bounds in the check above.
++        let left = unsafe { bindings::clear_user(self.0, len as _) } as usize;
++        if left != 0 {
++            ret = Err(EFAULT);
++            len -= left;
++        }
++
++        self.0 = self.0.wrapping_add(len);
++        self.1 -= len;
++        ret
++    }
++
++    unsafe fn write_raw(&mut self, data: *const u8, len: usize) -> Result {
++        if len > self.1 || len > u32::MAX as usize {
++            return Err(EFAULT);
++        }
++        let res = unsafe { bindings::copy_to_user(self.0, data as _, len as _) };
++        if res != 0 {
++            return Err(EFAULT);
++        }
++        // Since this is not a pointer to a valid object in our program,
++        // we cannot use `add`, which has C-style rules for defined
++        // behavior.
++        self.0 = self.0.wrapping_add(len);
++        self.1 -= len;
++        Ok(())
++    }
++}
++
